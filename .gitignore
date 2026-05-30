@@ -1,0 +1,13 @@
+data/
+staging/
+elon_tweet_ticks.parquet
+_merge_tmp.parquet
+_tmp_download.parquet
+*.parquet
+!scrape_elon_tweets.py
+!fetch_market_ids.py
+scrape_progress.json
+.tmp/
+__pycache__/
+*.pyc
+.DS_Store
