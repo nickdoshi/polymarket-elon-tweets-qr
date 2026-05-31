@@ -208,10 +208,22 @@ def extract_and_write(
     return row_count
 
 # ── Final merge ────────────────────────────────────────────────────────────────
+def _free_disk_gb() -> int:
+    """Return available disk space in GB (floor), minimum 10."""
+    import shutil
+    free = shutil.disk_usage(OUTPUT_DIR).free // (1024 ** 3)
+    return max(int(free), 10)
+
+
 def merge_staging_to_master() -> None:
     """
     Merge all staging/src_*.parquet files (plus any existing master) into
-    elon_tweet_ticks.parquet. Deduplicates on (condition_id, asset_id, timestamp_received).
+    elon_tweet_ticks.parquet.
+
+    Staging files come from distinct source hours so there are no cross-file
+    duplicates — UNION ALL is safe and avoids the global sort that DISTINCT ON
+    requires (which OOMs at ~2000+ files).
+
     Writes to a temp file first to avoid reading-from and writing-to the same path.
     """
     batch_files = sorted(STAGING_DIR.glob("src_*.parquet"))
@@ -230,13 +242,18 @@ def merge_staging_to_master() -> None:
           f"{' + existing master' if MASTER_FILE.exists() else ''} → {MASTER_FILE.name} ...")
 
     conn = duckdb.connect()
-    conn.execute("SET threads=4; SET memory_limit='4GB';")
+    conn.execute(
+        "SET threads=2; "
+        "SET memory_limit='4GB'; "
+        "SET preserve_insertion_order=false; "          # halves sort memory
+        f"PRAGMA max_temp_directory_size='{_free_disk_gb() - 2}GiB';"
+    )
 
+    # UNION ALL — no deduplication needed; each staging file = one source hour
     conn.execute(f"""
     COPY (
-        SELECT DISTINCT ON (condition_id, asset_id, timestamp_received) *
-        FROM read_parquet({file_list_sql}, union_by_name=true)
-        ORDER BY condition_id, asset_id, timestamp_received
+        SELECT * FROM read_parquet({file_list_sql}, union_by_name=true)
+        ORDER BY condition_id, asset_id, timestamp
     ) TO '{tmp_out}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
     """)
     row_count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_out}')").fetchone()[0]
