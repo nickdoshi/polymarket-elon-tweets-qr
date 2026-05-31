@@ -1,54 +1,51 @@
 """
 Elon Tweet Market — Archive Scraper
 Streams through ALL v1 and v2 parquet files, extracts only Elon tweet market rows,
-appends to a master parquet, then deletes the downloaded raw file to save disk space.
+writes results directly to staging parquets (no pandas accumulation), then merges.
 
 Strategy:
   - DuckDB does HTTP range-reads with predicate pushdown — only downloads relevant
     row groups for our condition IDs, not full 400 MB files.
-  - Batches of extracted rows are written to a staging/ subdirectory (one small
-    parquet per batch). A final merge step produces elon_tweet_ticks.parquet.
-    This avoids the O(n²) rewrite problem of appending to a single growing file.
+  - Each source file that has matching rows is written straight to a staging parquet
+    via DuckDB COPY — no pandas DataFrame is ever materialised in Python memory.
+    Peak RAM is bounded by DuckDB's memory_limit (2 GB), not by file count.
+  - A final merge step produces elon_tweet_ticks.parquet.
   - Resumes from a compact checkpoint (JSON with completed URL set + total row count).
   - Pre-downloaded files in data/ are used in-place (no re-download).
 
 Usage:
     python scrape_elon_tweets.py
+    python scrape_elon_tweets.py --merge-only
 
 Output:
     elon_tweet_ticks.parquet          — master parquet (created at end / on --merge)
-    staging/batch_NNNN.parquet        — incremental write buffers (auto-cleaned)
+    staging/src_NNNNNN.parquet        — per-source write buffers (auto-cleaned)
     scrape_progress.json              — resume checkpoint
 """
 
-import json, re, time
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import duckdb
-import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-OUTPUT_DIR    = Path("/Users/nick/Desktop/intern/POLYMARKET")
-MASTER_FILE   = OUTPUT_DIR / "elon_tweet_ticks.parquet"
-STAGING_DIR   = OUTPUT_DIR / "staging"
-PROGRESS_FILE = OUTPUT_DIR / "scrape_progress.json"
+OUTPUT_DIR     = Path("/Users/nick/Desktop/intern/POLYMARKET")
+MASTER_FILE    = OUTPUT_DIR / "elon_tweet_ticks.parquet"
+STAGING_DIR    = OUTPUT_DIR / "staging"
+PROGRESS_FILE  = OUTPUT_DIR / "scrape_progress.json"
 LOCAL_DATA_DIR = OUTPUT_DIR / "data"   # pre-downloaded raw parquets (skip re-download)
 
 V1_BASE = "https://r2.pmxt.dev/polymarket_orderbook_"
 V2_BASE = "https://r2v2.pmxt.dev/polymarket_orderbook_"
 
-# Keep these event types; skip tick_size_change (not useful for price/volume analysis)
 EVENT_TYPES_KEEP = ("price_change", "last_trade_price", "book")
-
-# Flush a batch file every N source files that contained data
-BATCH_FLUSH_EVERY = 25
 
 # ── Load condition IDs ─────────────────────────────────────────────────────────
 def load_condition_ids() -> list[str]:
     """
     Merge condition IDs from:
-      1. market_ids.json   — from PMXT API (current/active markets)
-      2. all_elon_cids_2026.json — from Polymarket CLOB API (historical markets)
+      1. market_ids.json          — from PMXT API (current/active markets)
+      2. all_elon_cids_2026.json  — from Polymarket CLOB API (historical markets)
     Run fetch_market_ids.py to regenerate these files if needed.
     """
     ids: set[str] = set()
@@ -62,7 +59,6 @@ def load_condition_ids() -> list[str]:
     clob_file = OUTPUT_DIR / "all_elon_cids_2026.json"
     if clob_file.exists():
         data = json.loads(clob_file.read_text())
-        # supports both "condition_ids" and "condition_ids_2026" keys
         ids.update(data.get("condition_ids", []))
         ids.update(data.get("condition_ids_2026", []))
 
@@ -74,7 +70,7 @@ def load_condition_ids() -> list[str]:
         )
 
     print(f"Loaded {len(ids)} distinct condition IDs.")
-    return sorted(ids)   # sorted for reproducibility
+    return sorted(ids)
 
 # ── Generate URL schedule ──────────────────────────────────────────────────────
 def generate_url_schedule() -> list[tuple[str, str, datetime]]:
@@ -86,15 +82,13 @@ def generate_url_schedule() -> list[tuple[str, str, datetime]]:
     """
     schedule: list[tuple[str, str, datetime]] = []
 
-    # v1 window
     v1_start = datetime(2026, 2, 21, 16)
-    v1_end   = datetime(2026, 4, 16, 7)   # exclusive upper bound
+    v1_end   = datetime(2026, 4, 16, 7)
     curr = v1_start
     while curr < v1_end:
         schedule.append((f"{V1_BASE}{curr.strftime('%Y-%m-%dT%H')}.parquet", "v1", curr))
         curr += timedelta(hours=1)
 
-    # v2 window — upper bound = today minus 5-day lag (archive is ~5 days behind)
     v2_start = datetime(2026, 4, 13, 19)
     v2_end   = datetime.utcnow() - timedelta(days=5)
     v2_end   = v2_end.replace(minute=0, second=0, microsecond=0)
@@ -112,40 +106,46 @@ def generate_url_schedule() -> list[tuple[str, str, datetime]]:
 def load_progress() -> dict:
     if PROGRESS_FILE.exists():
         return json.loads(PROGRESS_FILE.read_text())
-    return {"completed_urls": [], "total_rows": 0, "errors": [], "batch_count": 0}
+    return {"completed_urls": [], "total_rows": 0, "errors": [], "staging_count": 0}
 
 def save_progress(progress: dict) -> None:
     PROGRESS_FILE.write_text(json.dumps(progress, indent=2))
 
-# ── Extract rows from one source file ─────────────────────────────────────────
-def extract_from_source(
+# ── Schema detection ───────────────────────────────────────────────────────────
+def detect_schema(source: str, conn: duckdb.DuckDBPyConnection) -> str:
+    """
+    Inspect column names to determine actual file schema.
+    Returns 'v1', 'v2', or 'unknown'.
+    DuckDB with HTTP metadata cache makes this a metadata-only read (parquet footer).
+    """
+    cols = {row[0] for row in conn.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{source}') LIMIT 0"
+    ).fetchall()}
+    if "market_id" in cols:
+        return "v1"
+    if "market" in cols:
+        return "v2"
+    return "unknown"
+
+# ── Extract directly to parquet (no pandas) ────────────────────────────────────
+def extract_and_write(
     source: str,
     ids_sql: str,
     conn: duckdb.DuckDBPyConnection,
-    version: str,       # "v1" or "v2" — passed in from the schedule, no extra HTTP call
-) -> pd.DataFrame:
+    out_path: Path,
+) -> int:
     """
-    Handles both archive versions:
-
-    v1 schema (r2.pmxt.dev):
-        timestamp_received, timestamp_created_at, market_id (VARCHAR),
-        update_type, data (JSON blob)
-      JSON data fields: token_id, change_price, change_size, change_side,
-                        best_bid, best_ask, bids, asks
-
-    v2 schema (r2v2.pmxt.dev):
-        timestamp_received, timestamp, market (fixed_size_binary), event_type,
-        asset_id, price, size, side, best_bid, best_ask, bids, asks,
-        transaction_hash, ...
-
-    Output: unified DataFrame with columns:
-        timestamp_received, timestamp, condition_id, asset_id, event_type,
-        price, size, side, best_bid, best_ask, bids, asks,
-        transaction_hash, source_version
+    Detect schema, build query, write matching rows directly to a parquet file
+    using DuckDB COPY — no pandas DataFrame is ever created in Python memory.
+    Returns the number of rows written (0 = no data, out_path not created).
     """
+    actual = detect_schema(source, conn)
+    if actual == "unknown":
+        return 0
+
     event_types_sql = str(tuple(EVENT_TYPES_KEEP))
 
-    if version == "v1":
+    if actual == "v1":
         q = f"""
         SELECT
             timestamp_received,
@@ -175,7 +175,7 @@ def extract_from_source(
         WHERE market_id IN {ids_sql}
           AND update_type IN {event_types_sql}
         """
-    else:
+    else:  # v2
         q = f"""
         SELECT
             timestamp_received,
@@ -196,36 +196,29 @@ def extract_from_source(
         WHERE market::VARCHAR IN {ids_sql}
           AND event_type IN {event_types_sql}
         """
-    return conn.execute(q).fetchdf()
 
-# ── Staging writer ─────────────────────────────────────────────────────────────
-def write_batch(batch_df: pd.DataFrame, batch_num: int) -> Path:
-    """Write a batch DataFrame to staging/batch_NNNN.parquet."""
     STAGING_DIR.mkdir(exist_ok=True)
-    out = STAGING_DIR / f"batch_{batch_num:04d}.parquet"
-    conn = duckdb.connect()
-    conn.execute(f"""
-    COPY (SELECT * FROM batch_df ORDER BY condition_id, asset_id, timestamp)
-    TO '{out}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
-    """)
-    conn.close()
-    return out
+    row_count = conn.execute(f"""
+    COPY ({q}) TO '{out_path}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
+    """).fetchone()[0]
+
+    if row_count == 0:
+        out_path.unlink(missing_ok=True)
+
+    return row_count
 
 # ── Final merge ────────────────────────────────────────────────────────────────
 def merge_staging_to_master() -> None:
     """
-    Merge all staging/batch_*.parquet files (plus any existing master) into
+    Merge all staging/src_*.parquet files (plus any existing master) into
     elon_tweet_ticks.parquet. Deduplicates on (condition_id, asset_id, timestamp_received).
-
-    Uses an explicit file list (not glob inside list) so DuckDB expands correctly.
     Writes to a temp file first to avoid reading-from and writing-to the same path.
     """
-    batch_files = sorted(STAGING_DIR.glob("batch_*.parquet"))
+    batch_files = sorted(STAGING_DIR.glob("src_*.parquet"))
     if not batch_files:
-        print("No staging batches to merge.")
+        print("No staging files to merge.")
         return
 
-    # Build explicit file list — never pass a glob string inside a DuckDB list literal
     all_sources: list[Path] = list(batch_files)
     if MASTER_FILE.exists():
         all_sources.append(MASTER_FILE)
@@ -233,13 +226,12 @@ def merge_staging_to_master() -> None:
     file_list_sql = "[" + ", ".join(f"'{p}'" for p in all_sources) + "]"
     tmp_out = OUTPUT_DIR / "_merge_tmp.parquet"
 
-    print(f"\nMerging {len(batch_files)} batch(es)"
+    print(f"\nMerging {len(batch_files)} staging file(s)"
           f"{' + existing master' if MASTER_FILE.exists() else ''} → {MASTER_FILE.name} ...")
 
     conn = duckdb.connect()
-    conn.execute("SET threads=8; SET memory_limit='4GB';")
+    conn.execute("SET threads=4; SET memory_limit='4GB';")
 
-    # Write deduplicated result to temp file (avoids clobbering master while reading it)
     conn.execute(f"""
     COPY (
         SELECT DISTINCT ON (condition_id, asset_id, timestamp_received) *
@@ -250,12 +242,10 @@ def merge_staging_to_master() -> None:
     row_count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_out}')").fetchone()[0]
     conn.close()
 
-    # Atomic replace
     tmp_out.replace(MASTER_FILE)
     size_mb = MASTER_FILE.stat().st_size / 1e6
     print(f"Master parquet: {row_count:,} rows  {size_mb:.1f} MB")
 
-    # Clean up staging batches
     for f in batch_files:
         f.unlink()
     print("Staging directory cleaned.")
@@ -269,7 +259,6 @@ def main():
     progress = load_progress()
     completed_set = set(progress["completed_urls"])
 
-    # Build local file map: filename → full path (to use in-place instead of HTTP)
     local_map: dict[str, Path] = {}
     if LOCAL_DATA_DIR.exists():
         for p in LOCAL_DATA_DIR.glob("*.parquet"):
@@ -279,79 +268,59 @@ def main():
     pending = [(url, ver, dt) for url, ver, dt in schedule if url not in completed_set]
     print(f"\nAlready done: {len(completed_set)}  |  Remaining: {len(pending)}")
 
-    # Shared DuckDB connection for all HTTP reads (metadata cache is per-connection)
+    # Single connection for all reads — HTTP metadata cache is per-connection
+    # memory_limit bounds DuckDB's internal buffers; no pandas accumulation occurs
     conn = duckdb.connect()
     conn.execute("SET enable_http_metadata_cache=true; SET threads=4; SET memory_limit='2GB';")
 
-    batch_dfs: list[pd.DataFrame] = []
-    batch_num  = progress["batch_count"]
-    total_rows = progress["total_rows"]
-    files_done = 0
-    data_files = 0   # files that actually had tweet data
+    staging_count = progress.get("staging_count", 0)
+    total_rows    = progress["total_rows"]
+    files_done    = 0
 
     try:
         for url, version, dt in pending:
-            # Use local file if available, else HTTP
-            fname = Path(url).name
+            fname  = Path(url).name
             source = str(local_map[fname]) if fname in local_map else url
+            out_path = STAGING_DIR / f"src_{staging_count:06d}.parquet"
 
             try:
-                df = extract_from_source(source, ids_sql, conn, version)
+                row_count = extract_and_write(source, ids_sql, conn, out_path)
             except Exception as e:
                 err_str = str(e)
                 if "404" in err_str or "Not Found" in err_str:
-                    # Normal — archive has gaps
                     pass
                 else:
                     print(f"  ✗ {dt.strftime('%Y-%m-%dT%H')} [{version}]  {err_str[:80]}")
                     progress["errors"].append({"url": url, "dt": dt.isoformat(), "error": err_str})
-                # Mark as completed so we don't retry on resume
                 completed_set.add(url)
                 progress["completed_urls"].append(url)
                 continue
 
-            row_count = len(df)
             completed_set.add(url)
             progress["completed_urls"].append(url)
             files_done += 1
 
             if row_count > 0:
-                batch_dfs.append(df)
-                total_rows += row_count
-                data_files += 1
+                staging_count += 1
+                total_rows    += row_count
                 print(f"  ✓ {dt.strftime('%Y-%m-%dT%H')} [{version}]  "
                       f"+{row_count:,} rows  (running total: {total_rows:,})")
 
-            # Flush batch when enough data files have accumulated
-            if data_files >= BATCH_FLUSH_EVERY and batch_dfs:
-                combined = pd.concat(batch_dfs, ignore_index=True)
-                batch_path = write_batch(combined, batch_num)
-                batch_num += 1
-                batch_dfs = []
-                data_files = 0
-                progress["batch_count"] = batch_num
-                progress["total_rows"]  = total_rows
-                size_mb = batch_path.stat().st_size / 1e6
-                print(f"\n  → Wrote {batch_path.name}  ({size_mb:.1f} MB)  "
-                      f"[batches so far: {batch_num}]\n")
+            # Save checkpoint periodically (every 50 files processed)
+            if files_done % 50 == 0:
+                progress["staging_count"] = staging_count
+                progress["total_rows"]    = total_rows
                 save_progress(progress)
 
     except KeyboardInterrupt:
         print("\n⚠ Interrupted — saving progress checkpoint...")
 
     finally:
-        # Flush any remaining rows
-        if batch_dfs:
-            combined = pd.concat(batch_dfs, ignore_index=True)
-            write_batch(combined, batch_num)
-            batch_num += 1
-            progress["batch_count"] = batch_num
-
-        progress["total_rows"] = total_rows
+        progress["staging_count"] = staging_count
+        progress["total_rows"]    = total_rows
         save_progress(progress)
         conn.close()
 
-    # Merge all staging batches → master parquet
     merge_staging_to_master()
 
     remaining = [u for u, _, _ in schedule if u not in completed_set]
@@ -366,7 +335,6 @@ def main():
 if __name__ == "__main__":
     import sys
     if "--merge-only" in sys.argv:
-        # Just merge existing staging batches without scraping
         merge_staging_to_master()
     else:
         main()
