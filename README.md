@@ -149,3 +149,18 @@ The parquet enables you to track this spread over time at tick resolution.
 ```bash
 pip install pmxt duckdb pandas numpy matplotlib seaborn scipy statsmodels
 ```
+
+---
+
+## Ideas
+
+Don't predict Elon Tweet Intensity/Cadence
+PCA - main component should be market intensity
+    - spreads between front/back month
+
+Try predict principal component
+
+Features
+- Tweets? - hard to match up to the current data set
+- Returns for each of the markets/buckets
+- 

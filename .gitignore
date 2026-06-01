@@ -1,13 +1,25 @@
+# Large data files — regenerate with the scripts
+*.parquet
 data/
 staging/
-elon_tweet_ticks.parquet
+_1s_stage/
+_1s_inter/
+_merge_inter/
 _merge_tmp.parquet
-_tmp_download.parquet
-*.parquet
-!scrape_elon_tweets.py
-!fetch_market_ids.py
-scrape_progress.json
+_1s_tmp.parquet
+
 .tmp/
+
+# Runtime state
+scrape_progress.json
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+.env
+
+# OS
 .DS_Store
