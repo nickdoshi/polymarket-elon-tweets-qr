@@ -208,56 +208,98 @@ def extract_and_write(
     return row_count
 
 # ── Final merge ────────────────────────────────────────────────────────────────
-def _free_disk_gb() -> int:
-    """Return available disk space in GB (floor), minimum 10."""
-    import shutil
-    free = shutil.disk_usage(OUTPUT_DIR).free // (1024 ** 3)
-    return max(int(free), 10)
+MERGE_CHUNK_SIZE = 200  # files per intermediate merge pass
+
+def _master_schema_compatible() -> bool:
+    """True if the existing master has 'condition_id' (new schema), not just 'market'."""
+    if not MASTER_FILE.exists():
+        return False
+    conn = duckdb.connect()
+    cols = {r[0] for r in conn.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{MASTER_FILE}') LIMIT 0"
+    ).fetchall()}
+    conn.close()
+    return "condition_id" in cols
+
+
+def _copy_files(sources: list[Path], dest: Path, conn: duckdb.DuckDBPyConnection) -> None:
+    """Stream-copy a list of parquet files into dest — no sort, no dedup, O(1) disk."""
+    file_list = "[" + ", ".join(f"'{p}'" for p in sources) + "]"
+    conn.execute(f"""
+    COPY (SELECT * FROM read_parquet({file_list}, union_by_name=true))
+    TO '{dest}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
+    """)
 
 
 def merge_staging_to_master() -> None:
     """
-    Merge all staging/src_*.parquet files (plus any existing master) into
-    elon_tweet_ticks.parquet.
+    Merge all staging/src_*.parquet files into elon_tweet_ticks.parquet.
 
-    Staging files come from distinct source hours so there are no cross-file
-    duplicates — UNION ALL is safe and avoids the global sort that DISTINCT ON
-    requires (which OOMs at ~2000+ files).
-
-    Writes to a temp file first to avoid reading-from and writing-to the same path.
+    Design choices to avoid OOM / disk-full:
+      - No ORDER BY or DISTINCT ON: those force a full sort of every row onto
+        temp disk (~50 GB for 500 M rows). Streaming COPY is O(1) temp disk.
+      - Chunked merge: with 2000+ files a single read_parquet([...]) opens too
+        many file handles. We first merge chunks of MERGE_CHUNK_SIZE into
+        small intermediates, then do a final merge of those intermediates.
+      - Old master excluded if its schema predates the 'condition_id' rename
+        (it has a 'market' column instead — incompatible; the staging files
+        cover the same time range anyway).
     """
     batch_files = sorted(STAGING_DIR.glob("src_*.parquet"))
     if not batch_files:
         print("No staging files to merge.")
         return
 
-    all_sources: list[Path] = list(batch_files)
-    if MASTER_FILE.exists():
-        all_sources.append(MASTER_FILE)
+    include_master = _master_schema_compatible()
+    all_sources = list(batch_files) + ([MASTER_FILE] if include_master else [])
 
-    file_list_sql = "[" + ", ".join(f"'{p}'" for p in all_sources) + "]"
-    tmp_out = OUTPUT_DIR / "_merge_tmp.parquet"
+    tmp_out   = OUTPUT_DIR / "_merge_tmp.parquet"
+    inter_dir = OUTPUT_DIR / "_merge_inter"
 
     print(f"\nMerging {len(batch_files)} staging file(s)"
-          f"{' + existing master' if MASTER_FILE.exists() else ''} → {MASTER_FILE.name} ...")
+          f"{' + existing master' if include_master else ' (old master skipped — schema mismatch)'}"
+          f" → {MASTER_FILE.name} ...")
 
     conn = duckdb.connect()
     conn.execute(
         "SET threads=2; "
         "SET memory_limit='4GB'; "
-        "SET preserve_insertion_order=false; "          # halves sort memory
-        f"PRAGMA max_temp_directory_size='{_free_disk_gb() - 2}GiB';"
+        "SET preserve_insertion_order=false;"
     )
 
-    # UNION ALL — no deduplication needed; each staging file = one source hour
-    conn.execute(f"""
-    COPY (
-        SELECT * FROM read_parquet({file_list_sql}, union_by_name=true)
-        ORDER BY condition_id, asset_id, timestamp
-    ) TO '{tmp_out}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
-    """)
-    row_count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_out}')").fetchone()[0]
-    conn.close()
+    inter_files: list[Path] = []
+    try:
+        if len(all_sources) <= MERGE_CHUNK_SIZE:
+            _copy_files(all_sources, tmp_out, conn)
+        else:
+            # Pass 1: merge each chunk → one intermediate file
+            inter_dir.mkdir(exist_ok=True)
+            n_chunks = (len(all_sources) + MERGE_CHUNK_SIZE - 1) // MERGE_CHUNK_SIZE
+            for i in range(0, len(all_sources), MERGE_CHUNK_SIZE):
+                chunk = all_sources[i : i + MERGE_CHUNK_SIZE]
+                inter = inter_dir / f"inter_{i // MERGE_CHUNK_SIZE:04d}.parquet"
+                _copy_files(chunk, inter, conn)
+                inter_files.append(inter)
+                print(f"  chunk {i // MERGE_CHUNK_SIZE + 1}/{n_chunks}: "
+                      f"{len(chunk)} files → {inter.name}")
+
+            # Pass 2: merge all intermediates into final output
+            _copy_files(inter_files, tmp_out, conn)
+
+        row_count = conn.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{tmp_out}')"
+        ).fetchone()[0]
+
+    finally:
+        conn.close()
+        for f in inter_files:
+            if f.exists():
+                f.unlink()
+        if inter_dir.exists():
+            try:
+                inter_dir.rmdir()
+            except OSError:
+                pass
 
     tmp_out.replace(MASTER_FILE)
     size_mb = MASTER_FILE.stat().st_size / 1e6
